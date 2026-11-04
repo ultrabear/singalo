@@ -90,6 +90,24 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
             size,
         )
     }
+
+    /// Attempts to take ownership of block
+    fn begin_ownership(&self) -> Result<(), AllocError> {
+        // try to take ownership of block (if another caller has set allocated already we know we
+        // cant give out the block)
+        self.allocated
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| AllocError)
+            .map(|_| ())
+    }
+
+    /// Releases ownership of block
+    ///
+    /// # Safety
+    /// The caller must have ownership of block
+    unsafe fn end_ownership(&self) {
+        self.allocated.store(false, Ordering::Release);
+    }
 }
 
 // UB with UB: Allocator may never unwind (panic), but it is UB to pass certain arguments to
@@ -104,22 +122,34 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
                 NonNull::new_unchecked(UnsafeCell::raw_get(&raw const self.block).cast::<u8>())
             };
 
+            let offset = ptr.align_offset(layout.align());
 
-            ptr.align_offset(layout.align());
+            // align_offset error case
+            if offset == usize::MAX {
+                return Err(AllocError);
+            }
 
-            return Err(AllocError);
+            let size_avail = SIZE.checked_sub(offset).ok_or(AllocError)?;
+
+            if layout.size() > size_avail {
+                return Err(AllocError);
+            }
+
+            // SAFETY: constructed via successful align_offset that is in bounds of our SIZE
+            let ptr = unsafe { ptr.add(offset) };
+
+            // compuite last to not deadlock ownership flag
+            self.begin_ownership()?;
+
+            Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
         } else {
             // cant allocate more than our fixed size buffer
             if layout.size() > SIZE {
                 return Err(AllocError);
             }
 
-            // compute last to not deadlock:
-            // try to take ownership of block (if another caller has set allocated already we know we
-            // cant give out the block)
-            self.allocated
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .map_err(|_| AllocError)?;
+            // compuite last to not deadlock ownership flag
+            self.begin_ownership()?;
 
             // SAFETY: we took ownership of the block, checked size and alignment requirements, and can
             // hand it to the caller
@@ -134,7 +164,10 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
         );
 
         // release ownership of block
-        self.allocated.store(false, Ordering::Release);
+        // SAFETY: we have been passed ptr which means we can invalidate it, thus taking ownership back
+        unsafe {
+            self.end_ownership();
+        }
     }
 
     unsafe fn grow(
@@ -152,6 +185,8 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
             new_layout.size() >= old_layout.size(),
             "`new_layout.size()` must be greater than or equal to `old_layout.size()`"
         );
+
+        todo!();
 
         // assume block is owned by us as per Allocator contract
 
@@ -181,6 +216,7 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
     ) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: inherits safety of caller of grow_zeroed
         let grown = unsafe { self.grow(ptr, old_layout, new_layout)? };
+        todo!();
 
         // SAFETY: new_layout.size() must be greater than old_layout.size() so we will not underflow
         // additionally, the contract of grow_zeroed states the full `new_size` must be zeroed,
@@ -212,6 +248,8 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
             new_layout.size() <= old_layout.size(),
             "`new_layout.size()` must be smaller than or equal to `old_layout.size()`"
         );
+        
+        todo!();
 
         // reject superaligned data for now
         if new_layout.align() > A::ALIGN {
