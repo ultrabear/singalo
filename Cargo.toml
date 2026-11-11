@@ -2,5 +2,15 @@
 name = "singalo"
 version = "0.1.0"
 edition = "2024"
+keywords = ["allocator"]
+categories = ["no-alloc", "no-std", "memory-management"]
+homepage = "https://github.com/ultrabear/singalo"
+repository = "https://github.com/ultrabear/singalo" 
+description = "A crate providing a singleton Allocator impl"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+# happy Allocator release!
+rust-version = "1.100"
+
 
 [dependencies]
