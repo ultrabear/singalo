@@ -1,5 +1,5 @@
 """
-Generates alignments from 1<<0 to 1<<64
+Generates alignments that rustc accepts
 """
 
 

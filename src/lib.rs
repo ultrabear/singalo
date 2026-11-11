@@ -74,10 +74,11 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
     /// Generates a [`NonNull<[u8]>`][core::ptr::NonNull] with the requested size from the base of the singleton allocation block
     ///
     /// # Safety
-    /// Callers must ensure that they have ownership of the block (via the allocated [`AtomicBool`] for
-    /// alloc calls or pointer ownership via the grow/shrink methods)
     /// Callers must ensure that size is lesser than the SIZE const that defines [`SingleAllocator`]'s
     /// maximum allocation size
+    ///
+    /// This function does not operate with ownership of block, thus, it is safe to call before
+    /// gaining ownership, and it does not generate ownership
     unsafe fn unchecked_base_allocate(&self, size: usize) -> NonNull<[u8]> {
         NonNull::slice_from_raw_parts(
             // SAFETY: we have ensured that the layouts size is smaller than the block, so casting
@@ -108,14 +109,42 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
     unsafe fn end_ownership(&self) {
         self.allocated.store(false, Ordering::Release);
     }
-}
 
-// UB with UB: Allocator may never unwind (panic), but it is UB to pass certain arguments to
-// allocator methods (and arguments with cheap checks), in such scenarios we employ debug_assert
-// to panic anyways. The rationale being that if the caller has already envoked UB we are allowed to
-// do our own UB (with the goal of harm reduction)
-unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocator<SIZE, A> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    /// Returns whether the given pointer is within the bounds of this allocation for debug assertions
+    #[cfg(debug_assertions)]
+    fn within_allocation(&self, ptr: *const u8, layout: Layout) -> bool {
+        // we special case ZST allocations to be dangling, this means we compare to our custom ZST
+        // pointer (with guaranteed pointer eq) rather than our block pointer
+        if layout.size() == 0 {
+            return core::ptr::eq(ptr, core::ptr::without_provenance::<u8>(layout.align()));
+        }
+
+        let base = (&raw const self.block).cast::<u8>();
+        // SAFETY: block is [u8; SIZE], so base.add(SIZE) is within provenance
+        let end = unsafe { base.add(SIZE) };
+
+        base <= ptr && ptr <= end
+    }
+
+    /// Returns an offset pointer allocation if it fits in layout (if it needs to be offset at all)
+    ///
+    /// Note that this function does not require ownership of block to compute
+    /// and thus, it is not returning ownership in `Result::Ok`, only a valid memory region from block
+    /// that fits Layout.
+    fn block_for(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            // SAFETY: we are constructing a ZST allocation without any provenance,
+            // NonNull is upheld by layout.align() being NonZero
+            return Ok(unsafe {
+                NonNull::slice_from_raw_parts(
+                    NonNull::new_unchecked(
+                        core::ptr::without_provenance::<u8>(layout.align()).cast_mut(),
+                    ),
+                    0,
+                )
+            });
+        }
+
         // handle superaligned data
         if layout.align() > A::ALIGN {
             let ptr = unsafe {
@@ -138,9 +167,6 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
             // SAFETY: constructed via successful align_offset that is in bounds of our SIZE
             let ptr = unsafe { ptr.add(offset) };
 
-            // compuite last to not deadlock ownership flag
-            self.begin_ownership()?;
-
             Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
         } else {
             // cant allocate more than our fixed size buffer
@@ -148,18 +174,29 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
                 return Err(AllocError);
             }
 
-            // compuite last to not deadlock ownership flag
-            self.begin_ownership()?;
-
-            // SAFETY: we took ownership of the block, checked size and alignment requirements, and can
-            // hand it to the caller
+            // SAFETY: we checked size and alignment requirements, and can hand it to the caller
+            // we do not have ownership, so we do not provide it
             Ok(unsafe { self.unchecked_base_allocate(layout.size()) })
         }
     }
+}
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, _layout: Layout) {
+// UB with UB: Allocator may never unwind (panic), but it is UB to pass certain arguments to
+// allocator methods (and arguments with cheap checks), in such scenarios we employ debug_assert
+// to panic anyways. The rationale being that if the caller has already invoked UB we are allowed to
+// do our own UB (with the goal of harm reduction)
+unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocator<SIZE, A> {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let block = self.block_for(layout)?;
+
+        self.begin_ownership()?;
+
+        Ok(block)
+    }
+
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         debug_assert!(
-            core::ptr::eq(ptr.as_ptr(), (&raw const self.block).cast::<u8>()),
+            self.within_allocation(ptr.as_ptr(), layout),
             "ptr must be allocated by this SingleAllocator"
         );
 
@@ -177,7 +214,7 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         debug_assert!(
-            core::ptr::eq(ptr.as_ptr(), (&raw const self.block).cast::<u8>()),
+            self.within_allocation(ptr.as_ptr(), old_layout),
             "ptr must be allocated by this SingleAllocator"
         );
 
@@ -186,26 +223,33 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
             "`new_layout.size()` must be greater than or equal to `old_layout.size()`"
         );
 
-        todo!();
+        // SAFETY: as per grow contract, old_layout was previously allocated by our allocate
+        // function which means it must succeed here
+        let old_block = unsafe { self.block_for(old_layout).unwrap_unchecked() };
 
-        // assume block is owned by us as per Allocator contract
+        let new_block = self.block_for(new_layout)?;
 
-        // reject superaligned data for now
-        if new_layout.align() > A::ALIGN {
-            return Err(AllocError);
+        // optimization: we do not need to copy as the base pointer is the same
+        if core::ptr::eq(
+            old_block.as_ptr().cast::<u8>(),
+            new_block.as_ptr().cast::<u8>(),
+        ) {
+            return Ok(new_block);
         }
 
-        // cant allocate more than our fixed size buffer
-        if new_layout.size() > SIZE {
-            return Err(AllocError);
+        // SAFETY: old_block likely overlaps new_block so we use overlapping copy,
+        // we copy old_layout.size() and leave the grown portion uninit to match the grow contract
+        // old_layout size is within bounds of both allocations as per grow contract and our checks
+        // above
+        unsafe {
+            core::ptr::copy(
+                old_block.as_ptr().cast::<u8>(),
+                new_block.as_ptr().cast::<u8>(),
+                old_layout.size(),
+            );
         }
 
-        // rewriting is unnecessary as its the same allocation
-
-        // SAFETY: we check the size and alignment requirements above, a caller of grow must assert
-        // that _ptr+old_layout was previously handed out by this allocator, so we skip the
-        // ownership check (_ptr holds the ownership)
-        Ok(unsafe { self.unchecked_base_allocate(new_layout.size()) })
+        Ok(new_block)
     }
 
     unsafe fn grow_zeroed(
@@ -216,7 +260,6 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
     ) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY: inherits safety of caller of grow_zeroed
         let grown = unsafe { self.grow(ptr, old_layout, new_layout)? };
-        todo!();
 
         // SAFETY: new_layout.size() must be greater than old_layout.size() so we will not underflow
         // additionally, the contract of grow_zeroed states the full `new_size` must be zeroed,
@@ -240,7 +283,7 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         debug_assert!(
-            core::ptr::eq(ptr.as_ptr(), (&raw const self.block).cast::<u8>()),
+            self.within_allocation(ptr.as_ptr(), old_layout),
             "ptr must be allocated by this SingleAllocator"
         );
 
@@ -248,18 +291,31 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
             new_layout.size() <= old_layout.size(),
             "`new_layout.size()` must be smaller than or equal to `old_layout.size()`"
         );
-        
-        todo!();
 
-        // reject superaligned data for now
-        if new_layout.align() > A::ALIGN {
-            return Err(AllocError);
+        // SAFETY: old_layout was previously handed to us and successful as per caller contract
+        let old_block = unsafe { self.block_for(old_layout).unwrap_unchecked() };
+
+        let new_block = self.block_for(new_layout)?;
+
+        // Optimization: base pointers are same so we dont need to copy data
+        if core::ptr::eq(
+            old_block.as_ptr().cast::<u8>(),
+            new_block.as_ptr().cast::<u8>(),
+        ) {
+            return Ok(new_block);
         }
 
-        // SAFETY: new_layout.size() must be smaller than old_layout.size(), and a caller must have
-        // upheld that _ptr + old_layout was previously successfully allocated by this allocator
-        // (this, new_layout is guaranteed to fit aside from alignment differences which we check for)
-        Ok(unsafe { self.unchecked_base_allocate(new_layout.size()) })
+        // SAFETY: old_block likely overlaps new_block so we use overlapping copy,
+        // we copy new_layout.size() as it is smaller than old_layout and the size of the new allocation
+        unsafe {
+            core::ptr::copy(
+                old_block.as_ptr().cast::<u8>(),
+                new_block.as_ptr().cast::<u8>(),
+                new_layout.size(),
+            );
+        }
+
+        Ok(new_block)
     }
 }
 
@@ -271,7 +327,12 @@ impl<const SIZE: usize, A: AlignmentMarker> Default for SingleAllocator<SIZE, A>
 
 #[cfg(test)]
 mod tests {
-    use crate::{SingleAllocator, align::Alignment};
+    use crate::{
+        SingleAllocator,
+        align::{Alignment, AlignmentMarker},
+    };
+
+    use core::alloc::{Allocator, Layout};
 
     extern crate alloc;
 
@@ -321,5 +382,79 @@ mod tests {
 
         let canbox = alloc::boxed::Box::new_in([0u8; 500], &block);
         drop(canbox);
+    }
+
+    #[test]
+    fn ownership_once() {
+        let allocator = &SingleAllocator::<500, Alignment<8>>::new();
+
+        let ptr_one = allocator
+            .allocate(Layout::new::<u64>())
+            .expect("first allocation that fits succeeds");
+
+        allocator
+            .allocate(Layout::new::<u64>())
+            .expect_err("cannot allocate a second item");
+
+        unsafe { allocator.deallocate(ptr_one.cast::<u8>(), Layout::new::<u64>()) };
+
+        allocator
+            .allocate(Layout::new::<u64>())
+            .expect("deallocate releases ownership");
+    }
+
+    #[test]
+    fn grow() {
+        let allocator = &SingleAllocator::<500, Alignment<2>>::new();
+
+        let l1 = Layout::new::<[u32; 16]>();
+
+        let ptr = allocator.allocate(l1).expect("fits");
+
+        // increase size + align
+        let l2 = Layout::new::<[u64; 16]>();
+
+        // increasing alignment requirement works
+        let grown = unsafe { allocator.grow(ptr.cast::<u8>(), l1, l2).expect("fits") };
+
+        // increase size
+        let l3 = Layout::new::<[u64; 32]>();
+
+        unsafe {
+            allocator
+                .grow_zeroed(grown.cast::<u8>(), l2, l3)
+                .expect("fits")
+        };
+    }
+
+    #[test]
+    fn shrink() {
+        let allocator = &SingleAllocator::<500, Alignment<2>>::new();
+
+        let l1 = Layout::new::<[u64; 16]>();
+
+        let ptr = allocator.allocate(l1).expect("fits");
+
+        let l2 = Layout::new::<[u32; 16]>();
+
+        unsafe {
+            allocator
+                .shrink(ptr.cast::<u8>(), l1, l2)
+                .expect("can shrink")
+        };
+    }
+
+    #[test]
+    fn zst() {
+        let allocator = &SingleAllocator::<0, Alignment<{ 1 << 20 }>>::new();
+
+        let l1 = Layout::new::<[<Alignment<{ 1 << 20 }> as AlignmentMarker>::Aligned; 0]>();
+
+        let ptr = allocator.allocate(l1).expect("can allocate a ZST");
+
+        // safe to deallocate
+        unsafe {
+            allocator.deallocate(ptr.cast::<u8>(), l1);
+        }
     }
 }
