@@ -14,12 +14,30 @@
 //! it is expected that structures like `VecDeque`, `HashMap`, `Box` etc. have effective [Allocator]
 //! taking constructors (note `Box` has `new_in` but not zeroed/uninit constructors) and this crate
 //! becomes more generally useful.
+//!
+//!
+//! # Examples
+//! ```
+//! # extern crate alloc;
+//! # use alloc::vec::Vec;
+//! use singalo::{Alignment, SingleAllocator};
+//!
+//! const LEN: usize = 10;
+//!
+//! let allocator = SingleAllocator::<
+//!         { size_of::<u64>() * LEN },
+//!         Alignment<{ align_of::<u64>() }>
+//!     >::new();
+//!
+//! let ve = Vec::<u64, _>::with_capacity_in(LEN, &allocator);
+//!
+//! ```
 
 #![no_std]
 #![deny(clippy::pedantic)]
 #![warn(missing_docs, clippy::missing_docs_in_private_items)]
 
-#[cfg(doc)]
+#[cfg(any(test, doc))]
 extern crate alloc;
 
 use core::{
@@ -31,6 +49,8 @@ use core::{
 };
 
 pub mod align;
+
+pub use align::Alignment;
 
 use align::AlignmentMarker;
 
@@ -446,9 +466,9 @@ mod tests {
 
     #[test]
     fn zst() {
-        let allocator = &SingleAllocator::<0, Alignment<{ 1 << 20 }>>::new();
+        let allocator = &SingleAllocator::<0, Alignment<{ 1 << 10 }>>::new();
 
-        let l1 = Layout::new::<[<Alignment<{ 1 << 20 }> as AlignmentMarker>::Aligned; 0]>();
+        let l1 = Layout::new::<[<Alignment<{ 1 << 10 }> as AlignmentMarker>::Aligned; 0]>();
 
         let ptr = allocator.allocate(l1).expect("can allocate a ZST");
 
