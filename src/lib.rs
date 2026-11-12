@@ -76,8 +76,8 @@ pub struct SingleAllocator<const SIZE: usize, A: AlignmentMarker> {
     /// owns block, and them passing ptr to us is considered ownership in that scenario (so we only
     /// need to RMU during full dealloc/alloc calls)
     allocated: AtomicBool,
-    /// the block of memory, stored behind `UnsafeCell` to prevent accidental noalias violation,
-    /// though this is probably not strictly necessary for the implementation as is
+    /// the block of memory, stored behind `UnsafeCell` to prevent noalias violation and allow us to
+    /// hand out provenance to the block.
     block: UnsafeCell<AlignedBlock<SIZE, A>>,
 }
 
@@ -89,27 +89,6 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
             allocated: AtomicBool::new(false),
             block: UnsafeCell::new(AlignedBlock(MaybeUninit::uninit(), [])),
         }
-    }
-
-    /// Generates a [`NonNull<[u8]>`][core::ptr::NonNull] with the requested size from the base of the singleton allocation block
-    ///
-    /// # Safety
-    /// Callers must ensure that size is lesser than the SIZE const that defines [`SingleAllocator`]'s
-    /// maximum allocation size
-    ///
-    /// This function does not operate with ownership of block, thus, it is safe to call before
-    /// gaining ownership, and it does not generate ownership
-    unsafe fn unchecked_base_allocate(&self, size: usize) -> NonNull<[u8]> {
-        NonNull::slice_from_raw_parts(
-            // SAFETY: we have ensured that the layouts size is smaller than the block, so casting
-            // is safe, we have ensured that the pointer is non null as it comes from a &raw ref, we
-            // can safely create a NonNull<[u8]> with Uninit storage bytes as the Allocator::allocate
-            // contract states it may be uninit
-            unsafe {
-                NonNull::new_unchecked(UnsafeCell::raw_get(&raw const self.block).cast::<u8>())
-            },
-            size,
-        )
     }
 
     /// Attempts to take ownership of block
@@ -132,7 +111,7 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
 
     /// Returns whether the given pointer is within the bounds of this allocation for debug assertions
     #[cfg(debug_assertions)]
-    fn within_allocation(&self, ptr: *const u8, layout: Layout) -> bool {
+    fn is_our_allocation(&self, ptr: *const u8, layout: Layout) -> bool {
         // we special case ZST allocations to be dangling, this means we compare to our custom ZST
         // pointer (with guaranteed pointer eq) rather than our block pointer
         if layout.size() == 0 {
@@ -165,13 +144,13 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
             });
         }
 
+        // SAFETY: UnsafeCell::get returns a non null pointer, casting is sound as it takes us from
+        // [u8] to u8
+        let base_ptr = unsafe { NonNull::new_unchecked(self.block.get().cast::<u8>()) };
+
         // handle superaligned data
         if layout.align() > A::ALIGN {
-            let ptr = unsafe {
-                NonNull::new_unchecked(UnsafeCell::raw_get(&raw const self.block).cast::<u8>())
-            };
-
-            let offset = ptr.align_offset(layout.align());
+            let offset = base_ptr.align_offset(layout.align());
 
             // align_offset error case
             if offset == usize::MAX {
@@ -185,7 +164,7 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
             }
 
             // SAFETY: constructed via successful align_offset that is in bounds of our SIZE
-            let ptr = unsafe { ptr.add(offset) };
+            let ptr = unsafe { base_ptr.add(offset) };
 
             Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
         } else {
@@ -194,9 +173,8 @@ impl<const SIZE: usize, A: AlignmentMarker> SingleAllocator<SIZE, A> {
                 return Err(AllocError);
             }
 
-            // SAFETY: we checked size and alignment requirements, and can hand it to the caller
-            // we do not have ownership, so we do not provide it
-            Ok(unsafe { self.unchecked_base_allocate(layout.size()) })
+            // SAFETY: we have validated the layout size is smaller than our maximum length
+            Ok(NonNull::slice_from_raw_parts(base_ptr, layout.size()))
         }
     }
 }
@@ -216,7 +194,7 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         debug_assert!(
-            self.within_allocation(ptr.as_ptr(), layout),
+            self.is_our_allocation(ptr.as_ptr(), layout),
             "ptr must be allocated by this SingleAllocator"
         );
 
@@ -234,7 +212,7 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         debug_assert!(
-            self.within_allocation(ptr.as_ptr(), old_layout),
+            self.is_our_allocation(ptr.as_ptr(), old_layout),
             "ptr must be allocated by this SingleAllocator"
         );
 
@@ -303,7 +281,7 @@ unsafe impl<const SIZE: usize, A: AlignmentMarker> Allocator for &SingleAllocato
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         debug_assert!(
-            self.within_allocation(ptr.as_ptr(), old_layout),
+            self.is_our_allocation(ptr.as_ptr(), old_layout),
             "ptr must be allocated by this SingleAllocator"
         );
 
@@ -466,9 +444,9 @@ mod tests {
 
     #[test]
     fn zst() {
-        let allocator = &SingleAllocator::<0, Alignment<{ 1 << 10 }>>::new();
+        let allocator = &SingleAllocator::<0, Alignment<{ 1 << 5 }>>::new();
 
-        let l1 = Layout::new::<[<Alignment<{ 1 << 10 }> as AlignmentMarker>::Aligned; 0]>();
+        let l1 = Layout::new::<[<Alignment<{ 1 << 5 }> as AlignmentMarker>::Aligned; 0]>();
 
         let ptr = allocator.allocate(l1).expect("can allocate a ZST");
 
@@ -476,5 +454,33 @@ mod tests {
         unsafe {
             allocator.deallocate(ptr.cast::<u8>(), l1);
         }
+
+        // can handle superaligned ZST
+        let l2 = Layout::new::<[<Alignment<{ 1 << 7 }> as AlignmentMarker>::Aligned; 0]>();
+
+        let ptr = allocator
+            .allocate(l2)
+            .expect("can allocate a superaligned ZST");
+
+        // safe to deallocate
+        unsafe {
+            allocator.deallocate(ptr.cast::<u8>(), l2);
+        }
+    }
+
+    #[test]
+    fn unaligned_size() {
+        let allocator = &SingleAllocator::<100, Alignment<4>>::new();
+
+        let ptr = allocator
+            .allocate(Layout::from_size_align(13, 8).unwrap())
+            .expect("can handle superaligned and non multiple of align allocation");
+
+        assert_eq!(ptr.len(), 13);
+        // check alignment of 8 holds
+        assert!(
+            ptr.cast::<<Alignment<8> as AlignmentMarker>::Aligned>()
+                .is_aligned()
+        );
     }
 }
